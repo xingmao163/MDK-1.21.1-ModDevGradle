@@ -1,10 +1,24 @@
-name: Build
+# .github/workflows/build.yml
+name: Build and Release
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [ main, develop, 'feature/*' ]
+    tags: [ 'v*' ] # 推送v开头标签时自动发布
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch: # 允许手动触发构建
+
+# 发布GitHub Releases必需的权限
+permissions:
+  contents: write
+  pull-requests: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20 # 防止构建无限运行，适配Minecraft游戏测试
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -17,9 +31,67 @@ jobs:
         with:
           java-version: '21'
           distribution: 'temurin'
+          cache: 'gradle' # 显式启用Gradle依赖缓存
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 'wrapper' # 严格使用项目指定的Gradle版本
+          cache-write-only: ${{ github.ref == 'refs/heads/main' }} # 仅主分支更新缓存
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }} # 其他分支只读缓存
 
       - name: Build with Gradle
-        run: ./gradlew build
+        run: ./gradlew build --no-watch-fs --parallel --max-workers=2
+        env:
+          GRADLE_OPTS: "-Xmx3g -Dorg.gradle.daemon=false -Dorg.gradle.parallel=true"
+
+      - name: Run Minecraft Game Tests
+        if: success()
+        run: ./gradlew runGameTestServer
+        continue-on-error: true # 游戏测试失败不阻止主构建流程
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: mod-jars
+          path: build/libs/*.jar
+          retention-days: 30
+
+      - name: Upload unit test reports
+        uses: actions/upload-artifact@v4
+        if: always() # 即使测试失败也上传报告用于排查
+        with:
+          name: test-reports
+          path: build/reports/tests/test
+          retention-days: 14
+
+      - name: Upload game test reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: game-test-reports
+          path: run/gametest
+          retention-days: 14
+
+  # 自动发布任务：仅在推送版本标签时执行
+  release:
+    needs: build # 必须等待构建任务成功完成
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mod-jars
+          path: build/libs/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true # 自动生成官方格式的发布说明
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          files: build/libs/*.jar
